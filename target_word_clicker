@@ -1,0 +1,506 @@
+import argparse
+import sys
+import time
+
+
+def _import_deps():
+    try:
+        import cv2  # type: ignore
+    except Exception as e:
+        print("OpenCV (cv2) is required. Install: pip install opencv-python", file=sys.stderr)
+        raise
+
+    try:
+        import mss  # type: ignore
+    except Exception:
+        print("mss is required for screen capture. Install: pip install mss", file=sys.stderr)
+        raise
+
+    try:
+        from ultralytics import YOLO  # type: ignore
+    except Exception:
+        print("Ultralytics YOLO is required. Install: pip install ultralytics", file=sys.stderr)
+        raise
+
+    import numpy as np  # type: ignore
+
+    # Optional: OCR and clicking
+    easyocr = None
+    pyautogui = None
+    keyboard = None
+    pynput_keyboard = None
+    try:
+        import easyocr  # type: ignore
+    except Exception:
+        pass
+    try:
+        import pyautogui  # type: ignore
+    except Exception:
+        pass
+    try:
+        import keyboard  # type: ignore
+    except Exception:
+        pass
+    try:
+        from pynput import keyboard as pynput_keyboard  # type: ignore
+    except Exception:
+        pass
+
+    # Optional: torch for device auto-detection (CUDA/MPS)
+    torch = None
+    try:
+        import torch  # type: ignore
+    except Exception:
+        pass
+
+    return cv2, mss, YOLO, np, easyocr, pyautogui, torch, keyboard, pynput_keyboard
+
+
+def run(
+    weights: str = "yolov8n.pt",
+    conf: float = 0.25,
+    imgsz: int = 640,
+    device: str = "auto",
+    monitor: int = 1,
+    region: list | None = None,
+    show_fps: bool = True,
+    max_fps: float | int = 10,
+    scale: float = 1.0,
+    # OCR options1
+    enable_ocr: bool = True,
+    ocr_lang: str = "en",
+    ocr_interval: float = 0.5,
+    target_words: list[str] | None = ['Ing', 'Low'],
+    # Optional auto click
+    autoclick: str | None = None,  # one of: None, 'follow', 'following'
+    # Inference options
+    half: bool | None = None,
+    # Automation options
+    action_interval: float = 1.0,
+    scroll_step: int = 400,
+):
+    """
+    Capture the screen in real time, run YOLO detections, and display in a window.
+
+    Args:
+        weights: Path to YOLO model (e.g., 'yolov8n.pt').
+        conf: Confidence threshold (0..1).
+        imgsz: Inference image size.
+        device: Device string, e.g. 'cpu', '0' for first GPU.
+        monitor: Monitor index for full-screen capture (mss index, usually 1-based).
+        region: Optional [left, top, width, height] to capture a region.
+        show_fps: Overlay FPS text on output.
+        max_fps: Throttle capture/inference to this FPS (0 = unlimited).
+        scale: Resize output window by this factor (e.g., 0.75).
+    """
+
+    cv2, mss, YOLO, np, easyocr, pyautogui, torch, keyboard, pynput_keyboard = _import_deps()
+
+    # Resolve device (auto -> CUDA -> MPS -> CPU) and FP16
+    resolved_device = str(device)
+    is_cuda = False
+    if resolved_device.lower() in ("auto", "gpu"):
+        if torch is not None and hasattr(torch, "cuda") and torch.cuda.is_available():
+            resolved_device = "0"
+            is_cuda = True
+        elif torch is not None and hasattr(torch, "backends") and hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            resolved_device = "mps"
+            is_cuda = False
+        else:
+            resolved_device = "cpu"
+            is_cuda = False
+    else:
+        rd = resolved_device.lower()
+        is_cuda = (rd == "cuda") or rd.isdigit()
+
+    if half is None:
+        half = bool(is_cuda)
+
+    model = YOLO(weights)
+
+    # Quick runtime device log
+    try:
+        print(f"[device] YOLO -> {resolved_device} | CUDA={is_cuda} | half={half}")
+    except Exception:
+        pass
+
+    frame_interval = 0.0 if not max_fps else max(0.0, 1.0 / float(max_fps))
+
+    window_name = "YOLO Screen"
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+
+    with mss.mss() as sct:
+        if region and len(region) == 4:
+            mon = {
+                "left": int(region[0]),
+                "top": int(region[1]),
+                "width": int(region[2]),
+                "height": int(region[3]),
+            }
+        else:
+            monitors = sct.monitors  # list; index 0 is a virtual full screen, 1..N are real monitors
+            if not monitors:
+                raise RuntimeError("No monitors found for screen capture.")
+            if monitor < 0 or monitor >= len(monitors):
+                monitor = 1 if len(monitors) > 1 else 0
+            mon = monitors[monitor]
+
+        # Prepare OCR
+        if enable_ocr:
+            if easyocr is None:
+                print("easyocr is required for OCR. Install: pip install easyocr", file=sys.stderr)
+                raise RuntimeError("easyocr not installed")
+            langs = [x.strip() for x in ocr_lang.split(',') if x.strip()]
+            ocr_reader = easyocr.Reader(langs, gpu=bool(is_cuda))
+            try:
+                print(f"[device] easyocr -> {'GPU' if is_cuda else 'CPU'}")
+            except Exception:
+                pass
+            last_ocr_time = 0.0
+            if not target_words:
+                target_words = ["follow", "following"]
+            targets_lower = [t.lower() for t in target_words]
+        else:
+            ocr_reader = None
+
+        try:
+            last_found = {"follow": None, "following": None}
+            latest_best = None
+            automation_enabled = False
+            last_action_time = 0.0
+            hotkey_prev_down = False
+            last_toggle_time = 0.0
+            # Global hotkey via pynput (if available)
+            toggle_requested = [False]
+            last_toggle_time_ref = [0.0]
+            listener = None
+            if pynput_keyboard is not None:
+                def _on_press(key):
+                    now_t = time.time()
+                    if (now_t - last_toggle_time_ref[0]) <= 0.3:
+                        return
+                    try:
+                        # Num1 with NumLock off maps to Key.end
+                        if key == pynput_keyboard.Key.end:
+                            last_toggle_time_ref[0] = now_t
+                            toggle_requested[0] = True
+                            return
+                    except Exception:
+                        pass
+                    try:
+                        # Virtual-key code for Numpad1 on Windows is 97; End is 35
+                        if hasattr(key, 'vk') and key.vk in (97, 35):
+                            last_toggle_time_ref[0] = now_t
+                            toggle_requested[0] = True
+                            return
+                    except Exception:
+                        pass
+                    try:
+                        if hasattr(key, 'char') and key.char and key.char.lower() in ('1',):
+                            last_toggle_time_ref[0] = now_t
+                            toggle_requested[0] = True
+                            return
+                    except Exception:
+                        pass
+
+                try:
+                    listener = pynput_keyboard.Listener(on_press=_on_press)
+                    listener.daemon = True
+                    listener.start()
+                except Exception:
+                    listener = None
+            while True:
+                loop_start = time.time()
+                sct_img = sct.grab(mon)
+
+                frame = np.array(sct_img)
+                # Convert BGRA -> BGR for OpenCV/YOLO
+                frame = frame[:, :, :3][:, :, ::-1][:, :, ::-1]  # keep BGR
+                # Alternatively: cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+
+                results = model.predict(
+                    source=frame,
+                    conf=conf,
+                    imgsz=imgsz,
+                    device=resolved_device,
+                    half=half,
+                    verbose=False,
+                )
+
+                annotated = results[0].plot()
+
+                # OCR pass (throttled)
+                detections_for_click = []  # list of dicts with fields: label, text, conf, center, box, abs_center
+                now = time.time()
+                if enable_ocr and (now - last_ocr_time >= float(ocr_interval)):
+                    last_ocr_time = now
+                    # easyocr expects RGB
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    try:
+                        ocr_results = ocr_reader.readtext(frame_rgb)
+                    except Exception as e:
+                        ocr_results = []
+
+                    for box, text, score in ocr_results:
+                        if not text:
+                            continue
+                        t_lower = str(text).strip().lower()
+                        matched = None
+                        for target in targets_lower:
+                            if target in t_lower:
+                                matched = target
+                                break
+                        if not matched:
+                            continue
+
+                        # box is 4 points [[x1,y1],[x2,y2],[x3,y3],[x4,y4]] in frame coords
+                        xs = [p[0] for p in box]
+                        ys = [p[1] for p in box]
+                        x1, y1, x2, y2 = int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys))
+                        cx, cy = int((x1 + x2) / 2), int((y1 + y2) / 2)
+                        abs_cx = cx + int(mon.get("left", 0))
+                        abs_cy = cy + int(mon.get("top", 0))
+
+                        det = {
+                            "label": matched,
+                            "text": text,
+                            "conf": float(score),
+                            "center": (cx, cy),
+                            "box": (x1, y1, x2, y2),
+                            "abs_center": (abs_cx, abs_cy),
+                        }
+                        detections_for_click.append(det)
+
+                        # Draw overlay on annotated image
+                        color = (0, 200, 255) if matched == "follow" else (200, 100, 0)
+                        cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
+                        cv2.circle(annotated, (cx, cy), 4, (0, 255, 0), -1)
+                        cv2.putText(
+                            annotated,
+                            f"{matched} {score:.2f}",
+                            (x1, max(20, y1 - 6)),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.7,
+                            color,
+                            2,
+                            cv2.LINE_AA,
+                        )
+
+                    # Update last_found and print concise status
+                    current = {"follow": None, "following": None}
+                    for lab in ("follow", "following"):
+                        # Pick best by highest conf among matches
+                        cands = [d for d in detections_for_click if d["label"] == lab]
+                        if cands:
+                            best = max(cands, key=lambda d: d["conf"])
+                            current[lab] = best
+                    # Print only when something changes
+                    for lab in ("follow", "following"):
+                        prev = last_found.get(lab)
+                        curr = current.get(lab)
+                        if (prev is None and curr is not None) or (
+                            prev is not None and (
+                                curr is None or curr["abs_center"] != prev["abs_center"] or abs(curr["conf"] - prev["conf"]) > 1e-3
+                            )
+                        ):
+                            if curr is None:
+                                print(f"lost {lab}")
+                            else:
+                                x, y = curr["abs_center"]
+                                print(f"found {lab} at ({x},{y}) conf={curr['conf']:.2f}")
+                    last_found = current
+
+                    # Track best overall match among targets for automation actions
+                    if detections_for_click:
+                        latest_best = max(detections_for_click, key=lambda d: d["conf"])
+                    else:
+                        latest_best = None
+
+                    # Optional autoclick when requested
+                    if autoclick in ("follow", "following") and pyautogui is not None:
+                        cand = current.get(autoclick)
+                        if cand is not None:
+                            x, y = cand["abs_center"]
+                            try:
+                                pyautogui.moveTo(x, y)
+                                pyautogui.click()
+                                print(f"clicked {autoclick} at ({x},{y})")
+                            except Exception:
+                                pass
+
+                if scale and scale != 1.0:
+                    h, w = annotated.shape[:2]
+                    annotated = cv2.resize(annotated, (int(w * scale), int(h * scale)))
+
+                if show_fps:
+                    dt = time.time() - loop_start
+                    fps = (1.0 / dt) if dt > 1e-9 else 0.0
+                    cv2.putText(
+                        annotated,
+                        f"FPS: {fps:.1f}",
+                        (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        1.0,
+                        (0, 255, 0),
+                        2,
+                        cv2.LINE_AA,
+                    )
+
+                cv2.imshow(window_name, annotated)
+
+                key = cv2.waitKey(1) & 0xFF
+                if key in (27, ord("q")):
+                    break
+
+                # Toggle automation with Num1/'1' from three sources (pynput global, keyboard.is_pressed, OpenCV key)
+                # 1) Pynput event requested toggle
+                if toggle_requested[0]:
+                    automation_enabled = not automation_enabled
+                    print(f"automation: {'ON' if automation_enabled else 'OFF'}")
+                    toggle_requested[0] = False
+
+                # 2) keyboard.is_pressed (if available)
+                cv_down = (key == ord('1'))
+                kb_down = False
+                if keyboard is not None:
+                    try:
+                        # Try several variants for numpad 1
+                        kb_down = any(keyboard.is_pressed(name) for name in ('1', 'num1', 'numpad 1', 'num 1', 'end'))
+                    except Exception:
+                        kb_down = False
+                is_down = bool(cv_down or kb_down)
+
+                now_t = time.time()
+                if is_down and not hotkey_prev_down and (now_t - last_toggle_time) > 0.3:
+                    automation_enabled = not automation_enabled
+                    print(f"automation: {'ON' if automation_enabled else 'OFF'}")
+                    last_toggle_time = now_t
+                    hotkey_prev_down = True
+                elif not is_down:
+                    hotkey_prev_down = False
+
+                # Perform automation step at fixed interval
+                if automation_enabled and (time.time() - last_action_time) >= float(action_interval):
+                    if latest_best is not None and pyautogui is not None:
+                        x, y = latest_best["abs_center"]
+                        try:
+                            pyautogui.moveTo(x, y)
+                            pyautogui.click()
+                            print(f"action: clicked '{latest_best['label']}' at ({x},{y}) conf={latest_best['conf']:.2f}")
+                        except Exception as e:
+                            print(f"action error (click): {e}")
+                        last_action_time = time.time()
+                    else:
+                        # No targets -> scroll down one step
+                        if pyautogui is None:
+                            print("action: scroll requested but pyautogui not installed (pip install pyautogui)")
+                        else:
+                            try:
+                                pyautogui.scroll(-int(scroll_step))
+                                print(f"action: scrolled down {int(scroll_step)}")
+                            except Exception as e:
+                                print(f"action error (scroll): {e}")
+                        last_action_time = time.time()
+
+                if frame_interval:
+                    elapsed = time.time() - loop_start
+                    remaining = frame_interval - elapsed
+                    if remaining > 0:
+                        time.sleep(remaining)
+        finally:
+            cv2.destroyWindow(window_name)
+            try:
+                if listener is not None:
+                    listener.stop()
+            except Exception:
+                pass
+
+
+def parse_args(argv=None):
+    p = argparse.ArgumentParser(
+        description="Live YOLO detections on screen capture (mss + OpenCV)",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    p.add_argument("--weights", default="yolov8n.pt", help="Path to YOLO weights file")
+    p.add_argument("--conf", type=float, default=0.25, help="Confidence threshold")
+    p.add_argument("--imgsz", type=int, default=640, help="Inference image size")
+    p.add_argument(
+        "--device",
+        default="auto",
+        help="Device: 'auto' (CUDA/MPS if available), 'cpu', '0' (first CUDA), 'mps'",
+    )
+    p.add_argument("--monitor", type=int, default=1, help="Monitor index for full-screen capture (mss)")
+    p.add_argument(
+        "--region",
+        type=int,
+        nargs=4,
+        metavar=("LEFT", "TOP", "WIDTH", "HEIGHT"),
+        help="Optional capture region; overrides --monitor",
+    )
+    p.add_argument("--no-fps", action="store_true", help="Hide FPS overlay")
+    p.add_argument("--max-fps", type=float, default=0, help="Throttle to this FPS (0 = unlimited)")
+    p.add_argument("--scale", type=float, default=1.0, help="Resize output window by factor")
+    p.add_argument("--half", dest="half", action="store_true", help="Force FP16 (CUDA only)")
+    p.add_argument("--no-half", dest="half", action="store_false", help="Disable FP16")
+    p.set_defaults(half=None)
+    # OCR options
+    p.add_argument("--no-ocr", action="store_true", help="Disable OCR text detection")
+    p.add_argument("--ocr-lang", default="en", help="Comma-separated OCR languages for easyocr (e.g., 'en,ru')")
+    p.add_argument("--ocr-interval", type=float, default=0.5, help="Seconds between OCR passes")
+    p.add_argument(
+        "--targets",
+        default="",
+        help="Comma-separated target words to find via OCR (leave empty to prompt at startup)",
+    )
+    p.add_argument(
+        "--autoclick",
+        help="Optional: automatically click the first matching target when found (default: first target)",
+    )
+    # Automation
+    p.add_argument("--action-interval", type=float, default=1.0, help="Seconds between automation actions")
+    p.add_argument("--scroll-step", type=int, default=400, help="Scroll amount per step (positive up, negative down)")
+    return p.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+
+    # Determine targets: if not provided via CLI, prompt the user
+    targets = [t.strip() for t in str(args.targets).split(',') if t.strip()]
+    if not targets:
+        try:
+            user_word = ""
+            while not user_word:
+                user_word = input("Enter the word to find and click: ").strip()
+            targets = [user_word]
+            print(f"Target set to: {user_word}")
+        except KeyboardInterrupt:
+            print("\nCancelled by user.")
+            return
+
+    # Determine autoclick word: default to first target if not explicitly set
+    autoclick = args.autoclick if args.autoclick else targets[0]
+
+    run(
+        weights=args.weights,
+        conf=args.conf,
+        imgsz=args.imgsz,
+        device=args.device,
+        monitor=args.monitor,
+        region=args.region,
+        show_fps=not args.no_fps,
+        max_fps=args.max_fps,
+        scale=args.scale,
+        enable_ocr=not args.no_ocr,
+        ocr_lang=args.ocr_lang,
+        ocr_interval=args.ocr_interval,
+        target_words=targets,
+        autoclick=autoclick,
+        half=args.half,
+        action_interval=args.action_interval,
+        scroll_step=args.scroll_step,
+    )
+
+
+if __name__ == "__main__":
+    main()
